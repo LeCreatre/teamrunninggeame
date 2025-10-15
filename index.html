@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>TEAMmy's Run</title>
+  <meta name="theme-color" content="#132766" />
+  <link rel="manifest" href="manifest.webmanifest">
+  <style>
+    :root{
+      --team-blue:#132766;
+      --team-red:#C9301F;
+      --ui-bg: rgba(255,255,255,0.88);
+      --shadow: 0 8px 24px rgba(0,0,0,0.15);
+    }
+    html,body{ margin:0; height:100%; background:#e9f1ff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,"Noto Sans",sans-serif;
+      overscroll-behavior:none; touch-action:none; -webkit-user-select:none; user-select:none; color:#0a0a0a; }
+    #wrap{ position:fixed; inset:0; display:grid; grid-template-rows:auto 1fr; }
+    header{ display:flex; align-items:center; justify-content:center; padding:10px 12px; z-index:2; pointer-events:none; }
+    .title{ background:var(--ui-bg); box-shadow:var(--shadow); padding:8px 14px; border-radius:16px; font-weight:800; letter-spacing:.3px; color:var(--team-blue); }
+    .hud{ position:fixed; top:10px; right:10px; display:flex; gap:8px; z-index:2; pointer-events:none; }
+    .pill{ background:var(--ui-bg); box-shadow:var(--shadow); padding:6px 10px; border-radius:14px; font-weight:700; font-size:14px; }
+    canvas{ display:block; width:100vw; height:100vh; }
+    .toast{ position:fixed; left:50%; bottom:28px; transform:translateX(-50%); background:var(--ui-bg); box-shadow:var(--shadow);
+      padding:10px 14px; border-radius:16px; font-weight:700; opacity:0; transition:opacity .25s ease, transform .25s ease; }
+    .toast.show{ opacity:1; transform:translateX(-50%) translateY(-2px); }
+    .sr-only{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <header>
+      <div class="title">TEAMmy's Run</div>
+      <span class="sr-only">Прыгай через препятствия. Тап или пробел — прыжок и рестарт.</span>
+    </header>
+    <div class="hud">
+      <div class="pill" id="score">Счёт: 0</div>
+      <div class="pill" id="best">Рекорд: 0</div>
+    </div>
+    <canvas id="game"></canvas>
+    <div class="toast" id="toast">Столкновение! Нажмите пробел или тапните для рестарта</div>
+  </div>
+
+<script>
+/* ====== HUD ====== */
+const scoreEl = document.getElementById('score');
+const bestEl  = document.getElementById('best');
+const toast   = document.getElementById('toast');
+function showToast(text, ms=1200){
+  toast.textContent = text;
+  toast.classList.add('show');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(()=>toast.classList.remove('show'), ms);
+}
+
+/* ====== CANVAS & STATE ====== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha:false });
+let DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+const STATE = { RUN:'run', OVER:'over' };
+let gameState = STATE.RUN;
+
+let w=0, h=0, last=0;
+const groundY = ()=> Math.floor(h*0.78);
+
+const world = {
+  speed: 320,       // мягкий старт
+  speedMax: 780,
+  accel: 12,
+  gravity: 2200,
+  jumpVel: 920,
+  score: 0,
+  milestone: 100,
+  best: Number(localStorage.getItem('teammy_best') || 0)
+};
+bestEl.textContent = `Рекорд: ${world.best}`;
+
+/* ====== AUDIO (WebAudio без файлов) ====== */
+const AC = window.AudioContext || window.webkitAudioContext;
+const audio = new AC();
+function beep({freq=440,dur=0.08,type='square',gain=0.03}={}){
+  const t = audio.currentTime;
+  const o = audio.createOscillator();
+  const g = audio.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.value = gain;
+  o.connect(g); g.connect(audio.destination);
+  o.start(t); o.stop(t+dur);
+}
+const sJump = ()=>beep({freq:720,dur:0.06,type:'square',gain:0.045});
+const sScore= ()=>beep({freq:520,dur:0.07,type:'triangle',gain:0.035});
+const sHit  = ()=>beep({freq:200,dur:0.12,type:'sawtooth',gain:0.06});
+
+/* ====== WORLD OBJECTS ====== */
+const mascot = { x:0, y:0, vy:0, w:84, h:96, onGround:true };
+const obstacles = [];
+const clouds=[], buildings=[], bushes=[];
+
+function resize(){
+  w = Math.floor(window.innerWidth * DPR);
+  h = Math.floor(window.innerHeight * DPR);
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = '100vw'; canvas.style.height = '100vh';
+
+  mascot.x = Math.floor(w*0.18);
+  mascot.y = groundY() - mascot.h;
+
+  if (!clouds.length) spawnClouds();
+  if (!buildings.length) spawnBuildings();
+  if (!bushes.length) spawnBushes();
+  if (!obstacles.length) spawnObstacle(true);
+}
+addEventListener('resize', resize, {passive:true});
+resize();
+
+/* ====== SPAWNERS ====== */
+function spawnClouds(){
+  clouds.length=0;
+  const n = Math.max(3, Math.floor(w/600));
+  for(let i=0;i<n;i++){
+    clouds.push({ x:Math.random()*w, y:Math.random()*h*0.33, spd:20+Math.random()*25, r:30+Math.random()*40 });
+  }
+}
+function spawnBuildings(){
+  buildings.length=0;
+  let x=0;
+  while(x < w*1.7){
+    const bw = 140+Math.random()*90, bh = 170+Math.random()*50;
+    buildings.push({ x, y: groundY()-bh, w:bw, h:bh, spd:0.35 });
+    x += bw + 70*Math.random();
+  }
+}
+function spawnBushes(){
+  bushes.length=0;
+  let x=0;
+  while(x < w*1.9){
+    const bw = 60+Math.random()*30, bh = 22+Math.random()*12;
+    bushes.push({ x, y: groundY()-10, w:bw, h:bh, spd:0.62 });
+    x += bw + 40 + Math.random()*110;
+  }
+}
+function spawnObstacle(initial=false){
+  const t = Math.random();
+  let obj;
+  if (t<0.45) obj = {kind:'cone', w:44, h:52};
+  else if (t<0.8) obj = {kind:'bin', w:52, h:60};
+  else obj = {kind:'box', w:58, h:46};
+
+  const minGap = Math.max(260, 210 + world.speed*0.36);
+  const maxGap = Math.max(minGap+90, minGap + 240);
+  const gap = initial ? w*0.55 : (minGap + Math.random()*(maxGap-minGap));
+  const x = (obstacles.length? obstacles[obstacles.length-1].x : w) + gap;
+
+  obstacles.push({ x, y:groundY(), ...obj, passed:false });
+  while(obstacles.length>8) obstacles.shift();
+}
+
+/* ====== RESTART ====== */
+function restart(){
+  world.speed=320; world.score=0;
+  obstacles.length=0; spawnObstacle(true);
+  mascot.vy=0; mascot.onGround=true; mascot.y=groundY()-mascot.h;
+  gameState=STATE.RUN; toast.classList.remove('show');
+}
+
+/* ====== INPUT ====== */
+function jumpOrRestart(){
+  if (gameState===STATE.OVER){ restart(); return; }
+  if (mascot.onGround){
+    mascot.vy = -world.jumpVel; mascot.onGround=false; sJump();
+  }
+}
+addEventListener('keydown', e=>{
+  if (e.code==='Space' || e.key===' '){ e.preventDefault(); jumpOrRestart(); }
+},{passive:false});
+addEventListener('touchstart', e=>{ e.preventDefault(); jumpOrRestart(); }, {passive:false});
+
+/* ====== GAME LOOP ====== */
+function step(ts){
+  if (!last) last=ts;
+  const dt = Math.min(0.033, (ts-last)/1000); last=ts;
+
+  if (gameState===STATE.RUN){
+    world.speed = Math.min(world.speedMax, world.speed + world.accel*dt);
+  }
+
+  drawSky();
+  // clouds
+  for (const c of clouds){
+    c.x -= c.spd*dt;
+    if (c.x < -120){ c.x = w + Math.random()*200; c.y = Math.random()*h*0.33; }
+    drawCloud(c);
+  }
+  // buildings
+  for (const b of buildings){
+    b.x -= world.speed*b.spd*dt;
+    if (b.x + b.w < -40){
+      const lastX = Math.max(...buildings.map(v=>v.x+v.w));
+      b.x = lastX + 60 + Math.random()*100;
+      b.w = 140+Math.random()*90; b.h = 170+Math.random()*50; b.y = groundY()-b.h;
+    }
+    drawBuilding(b);
+  }
+  drawGround();
+  // bushes (near)
+  for (const t of bushes){
+    t.x -= world.speed*t.spd*dt;
+    if (t.x + t.w < -20){
+      const lastX = Math.max(...bushes.map(v=>v.x+v.w));
+      t.x = lastX + 40 + Math.random()*120;
+      t.w = 60+Math.random()*30; t.h = 22+Math.random()*12;
+      t.y = groundY()-10;
+    }
+    drawBush(t);
+  }
+  // obstacles
+  if (gameState===STATE.RUN){
+    for(const o of obstacles) o.x -= world.speed*dt;
+    if (obstacles.length && obstacles[0].x + obstacles[0].w < -40) obstacles.shift();
+    const rightMost = obstacles.length? obstacles[obstacles.length-1].x : -1;
+    if (rightMost < w*0.85) spawnObstacle();
+  }
+  for(const o of obstacles) drawObstacle(o);
+
+  // physics
+  if (!mascot.onGround){
+    mascot.vy += world.gravity*dt;
+    mascot.y += mascot.vy*dt;
+    if (mascot.y >= groundY()-mascot.h){
+      mascot.y = groundY()-mascot.h; mascot.vy=0; mascot.onGround=true;
+    }
+  }
+
+  drawMascot(mascot.x, mascot.y, mascot.w, mascot.h);
+
+  // score
+  if (gameState===STATE.RUN){
+    world.score += world.speed*dt*0.05;
+    const sc = Math.floor(world.score);
+    scoreEl.textContent = `Счёт: ${sc}`;
+    if (sc>0 && sc%world.milestone===0 && step._ms!==sc){ step._ms=sc; sScore(); }
+  }
+
+  // pass bonus
+  if (gameState===STATE.RUN){
+    for (const o of obstacles){
+      if (!o.passed && o.x + o.w < mascot.x){ o.passed=true; world.score += 5; }
+    }
+  }
+
+  // collision (с небольшим «паддингом»)
+  if (gameState===STATE.RUN){
+    const pad=10;
+    const mx1=mascot.x+pad, my1=mascot.y+pad;
+    const mx2=mascot.x+mascot.w-pad, my2=mascot.y+mascot.h-pad;
+    for (const o of obstacles){
+      const ox1=o.x+3, oy1=groundY()-o.h, ox2=o.x+o.w-3, oy2=groundY();
+      if (mx1<ox2 && mx2>ox1 && my1<oy2 && my2>oy1){
+        gameState=STATE.OVER; sHit();
+        const sc = Math.floor(world.score);
+        if (sc>world.best){ world.best=sc; localStorage.setItem('teammy_best', String(sc)); }
+        bestEl.textContent = `Рекорд: ${world.best}`;
+        showToast('Столкновение! Нажмите пробел или тапните для рестарта', 1600);
+        break;
+      }
+    }
+  }
+
+  requestAnimationFrame(step);
+}
+
+/* ====== DRAWING ====== */
+function drawSky(){
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0, '#f5fbff'); g.addColorStop(1, '#e9f1ff');
+  ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
+}
+function drawCloud(c){
+  ctx.save(); ctx.translate(c.x,c.y);
+  ctx.fillStyle='rgba(255,255,255,0.9)'; blob(0,0, c.r*2, 6); ctx.restore();
+}
+function drawBuilding(b){
+  ctx.save(); ctx.translate(b.x,b.y+b.h);
+  ctx.fillStyle='#cdd7f2'; roundRect(0,-b.h,b.w,b.h,10,true,false);
+  ctx.fillStyle='#e6edff';
+  const cols=Math.max(2,Math.floor(b.w/28)), rows=Math.max(2,Math.floor(b.h/38));
+  for(let i=0;i<cols;i++) for(let j=0;j<rows;j++){
+    roundRect(8+i*((b.w-16)/cols), -b.h+10+j*((b.h-20)/rows), 14,18,4,true,false);
+  }
+  ctx.restore();
+}
+function drawGround(){
+  ctx.fillStyle='#b8e0c2'; ctx.fillRect(0, groundY(), w, Math.max(1,h-groundY()));
+  ctx.fillStyle='#e2d6cf'; ctx.fillRect(0, groundY()+6, w, Math.max(1,h-groundY()-6));
+  ctx.strokeStyle='rgba(0,0,0,0.05)'; ctx.lineWidth=2; ctx.setLineDash([18,16]);
+  ctx.beginPath(); ctx.moveTo(0, groundY()+18); ctx.lineTo(w, groundY()+18); ctx.stroke(); ctx.setLineDash([]);
+}
+function drawBush(t){ ctx.save(); ctx.translate(t.x,t.y); ctx.fillStyle='#7ecb8a'; blob(0,0,t.w,5); ctx.restore(); }
+function drawObstacle(o){
+  ctx.save(); ctx.translate(o.x, groundY());
+  if (o.kind==='cone'){
+    const bw=o.w,bh=o.h;
+    ctx.fillStyle='#ffb199';
+    ctx.beginPath(); ctx.moveTo(6,0); ctx.lineTo(bw-6,0); ctx.lineTo(bw*0.65,-bh); ctx.lineTo(bw*0.35,-bh); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#ffffffbb'; ctx.fillRect(bw*0.25,-bh*0.62,bw*0.5,8); ctx.fillRect(bw*0.2,-bh*0.32,bw*0.6,8);
+  }else if(o.kind==='bin'){
+    const bw=o.w,bh=o.h; ctx.fillStyle='#8aa0c9'; roundRect(0,-bh,bw,bh,6,true,false);
+    ctx.fillStyle='#6c82ad'; roundRect(4,-bh-8,bw-8,14,6,true,false);
+    ctx.fillStyle='#d9e3ff66'; roundRect(8,-bh+10,bw-16,bh-22,6,true,false);
+  }else{
+    const bw=o.w,bh=o.h; ctx.fillStyle='#cfa97a'; roundRect(0,-bh,bw,bh,6,true,false);
+    ctx.strokeStyle='#9f7c53'; ctx.lineWidth=3; ctx.beginPath();
+    ctx.moveTo(0,-bh+8); ctx.lineTo(bw,-bh+8); ctx.moveTo(0,-8); ctx.lineTo(bw,-8); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* === МАСКОТ (перерисован по референсу) === */
+function drawMascot(x,y,wid,hei){
+  ctx.save(); ctx.translate(x,y);
+
+  // тень
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ellipse(wid*0.5, hei+8, Math.max(28,wid*0.9), 7);
+
+  // ноги/брюки (тёмно-синие)
+  ctx.fillStyle='#1a2653';
+  roundRect(6, hei-38, wid*0.42, 38, 10, true, false);
+  roundRect(wid-6-wid*0.42, hei-26, wid*0.42, 26, 10, true, false);
+
+  // кроссовки
+  function shoe(sx, sy, flip=false){
+    ctx.save(); ctx.translate(sx, sy); if (flip) ctx.scale(-1,1);
+    ctx.fillStyle='#ffffff'; roundRect(0,0, 38,16, 6, true, false);
+    ctx.fillStyle='#d7dde7'; roundRect(6,12, 26,4, 2, true, false);
+    ctx.strokeStyle='#c2c8d6'; ctx.lineWidth=2; ctx.strokeRect(2,2,34,12);
+    // декоративная дуга вместо логотипа
+    ctx.beginPath(); ctx.strokeStyle='#132766'; ctx.lineWidth=3;
+    ctx.moveTo(10,8); ctx.quadraticCurveTo(20,2, 28,8); ctx.stroke();
+    ctx.restore();
+  }
+  shoe(2, hei-18, false);
+  shoe(wid-40, hei-12, true);
+
+  // хвост (серый с пятнами)
+  ctx.fillStyle='#c7c7c9';
+  ctx.beginPath();
+  ctx.moveTo(wid*0.15, hei-46);
+  ctx.quadraticCurveTo(-18, hei-34, 12, hei-18);
+  ctx.quadraticCurveTo(40, hei-6, 58, hei-22);
+  ctx.quadraticCurveTo(34, hei-28, 30, hei-38);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#a9a9ab';
+  ellipse(18, hei-30, 10,6); ellipse(40, hei-16, 9,5);
+
+  // торс (футболка оранжевая)
+  ctx.fillStyle='#C9301F';
+  roundRect(6, 34, wid-12, 44, 12, true, false); // тело
+  // рукава (по бокам)
+  roundRect(-4, 38, 20, 22, 10, true, false);
+  roundRect(wid-16, 38, 20, 22, 10, true, false);
+
+  // белый принт «DARE TO BE FIRST» (упрощённый набор)
+  ctx.fillStyle='#ffffff'; ctx.font=`${14*DPR}px/1.1 ui-sans-serif,system-ui,Arial`;
+  ctx.textAlign='center'; ctx.textBaseline='top';
+  ctx.fillText('DARE', wid/2, 44);
+  ctx.fillText('TO BE', wid/2, 58);
+  ctx.fillText('FIRST', wid/2, 72);
+
+  // шея
+  ctx.fillStyle='#d9d9db'; roundRect(wid*0.4, 28, wid*0.2, 10, 4, true, false);
+
+  // голова (серый кот)
+  const headW=wid*0.9, headH=56, hx=(wid-headW)/2, hy=-6;
+  // уши
+  ctx.fillStyle='#8f8f93';
+  triangle(hx+18,hy+12,  hx+36,hy-10,  hx+52,hy+12);
+  triangle(hx+headW-52,hy+12,  hx+headW-36,hy-10,  hx+headW-18,hy+12);
+
+  // голова форма
+  ctx.fillStyle='#bfbfc1';
+  roundRect(hx, hy, headW, headH, 22, true, false);
+
+  // светлая мордочка
+  ctx.fillStyle='#ececef';
+  roundRect(hx+16, hy+22, headW-32, 22, 10, true, false);
+
+  // пятна
+  ctx.fillStyle='#a9a9ab';
+  ellipse(hx+24, hy+16, 8,6);
+  ellipse(hx+headW-24, hy+16, 8,6);
+  ellipse(hx+headW*0.5, hy+10, 10,6);
+
+  // глаза (зелёные)
+  ctx.fillStyle='#2ca45d';
+  ellipse(hx+headW*0.33, hy+30, 9,11);
+  ellipse(hx+headW*0.67, hy+30, 9,11);
+  ctx.fillStyle='#0b1a35';
+  ellipse(hx+headW*0.33, hy+30, 4,8);
+  ellipse(hx+headW*0.67, hy+30, 4,8);
+  ctx.fillStyle='#ffffff';
+  ellipse(hx+headW*0.33-3, hy+28, 2,3);
+  ellipse(hx+headW*0.67-3, hy+28, 2,3);
+
+  // нос и рот
+  ctx.fillStyle='#f2a7a2';
+  roundRect(hx+headW*0.5-5, hy+34, 10,6, 3, true, false);
+  ctx.fillStyle='#6b6b6d';
+  ctx.beginPath();
+  ctx.moveTo(hx+headW*0.5, hy+40);
+  ctx.quadraticCurveTo(hx+headW*0.5, hy+46, hx+headW*0.5-8, hy+46);
+  ctx.moveTo(hx+headW*0.5, hy+40);
+  ctx.quadraticCurveTo(hx+headW*0.5, hy+46, hx+headW*0.5+8, hy+46);
+  ctx.strokeStyle='#6b6b6d'; ctx.lineWidth=2; ctx.stroke();
+
+  // повязка ENTREPRENEUR
+  ctx.fillStyle='#C9301F';
+  roundRect(hx+8, hy-2, headW-16, 18, 9, true, false);
+  ctx.fillStyle='#ffffff'; ctx.font=`${10*DPR}px/1 ui-sans-serif,Arial`; ctx.textAlign='center';
+  ctx.fillText('ENTREPRENEUR', hx+headW/2, hy+1);
+
+  // руки (серые) с кулачками
+  ctx.fillStyle='#bfbfc1';
+  roundRect(-6, 52, 26, 24, 12, true, false);   // левая
+  roundRect(wid-20, 20, 26, 28, 12, true, false); // правая поднята
+  // пятна на руках
+  ctx.fillStyle='#a9a9ab';
+  ellipse(6, 64, 5,4); ellipse(wid-6, 34, 5,4);
+
+  ctx.restore();
+}
+
+/* ====== PRIMITIVES ====== */
+function roundRect(x,y,w,h,r,fill,stroke){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  if (fill) ctx.fill(); if (stroke) ctx.stroke();
+}
+function ellipse(cx,cy,rw,rh){
+  ctx.save(); ctx.beginPath(); ctx.translate(cx,cy); ctx.scale(rw,rh); ctx.arc(0,0,1,0,Math.PI*2); ctx.restore(); ctx.fill();
+}
+function blob(x,y,w,bumps=5){
+  ctx.beginPath(); const h=w*0.55;
+  for(let i=0;i<=bumps;i++){ const px=x+(w/bumps)*i; const py=y+Math.sin(i*1.3)*6; if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); }
+  ctx.lineTo(x+w,y+h); ctx.lineTo(x,y+h); ctx.closePath(); ctx.fill();
+}
+function triangle(x1,y1,x2,y2,x3,y3){ ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3); ctx.closePath(); ctx.fill(); }
+
+/* ====== SERVICE WORKER ====== */
+if ('serviceWorker' in navigator){
+  addEventListener('load', ()=> navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+}
+
+/* ====== START ====== */
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
